@@ -111,6 +111,8 @@ window.textsecure.utils = function() {
             for (var key in thing)
                 res[key] = ensureStringed(thing[key]);
             return res;
+        } else if (thing === null) {
+            return null;
         }
         throw new Error("unsure of how to jsonify object of type " + typeof thing);
 
@@ -251,9 +253,15 @@ textsecure.processDecrypted = function(decrypted, source) {
     return Promise.all(promises).then(function() {
         return decrypted;
     });
-}
+};
 
-window.textsecure.registerSingleDevice = function(number, verificationCode, stepDone) {
+window.textsecure.generateKeys = function(progressCallback) {
+    return textsecure.protocol_wrapper.generateKeys().then(textsecure.api.registerKeys);
+};
+
+function createAccount(number, verificationCode, identityKeyPair, single_device) {
+    textsecure.storage.put('identityKey', identityKeyPair);
+
     var signalingKey = textsecure.crypto.getRandomBytes(32 + 20);
     textsecure.storage.put('signaling_key', signalingKey);
 
@@ -261,38 +269,53 @@ window.textsecure.registerSingleDevice = function(number, verificationCode, step
     password = password.substring(0, password.length - 2);
     textsecure.storage.put("password", password);
 
-    var registrationId = new Uint16Array(textsecure.crypto.getRandomBytes(2))[0];
-    registrationId = registrationId & 0x3fff;
+    var registrationId = axolotl.util.generateRegistrationId();
     textsecure.storage.put("registrationId", registrationId);
 
-    return textsecure.api.confirmCode(number, verificationCode, password, signalingKey, registrationId, true).then(function() {
-        textsecure.storage.user.setNumberAndDeviceId(number, 1);
+    return textsecure.api.confirmCode(
+        number, verificationCode, password, signalingKey, registrationId, single_device
+    ).then(function(response) {
+        textsecure.storage.user.setNumberAndDeviceId(number, response.deviceId);
         textsecure.storage.put("regionCode", libphonenumber.util.getRegionCodeForNumber(number));
-        stepDone(1);
 
-        return textsecure.protocol_wrapper.generateKeys().then(function(keys) {
-            stepDone(2);
-            return textsecure.api.registerKeys(keys).then(function() {
-                stepDone(3);
-            });
-        });
+        return textsecure.generateKeys().then(textsecure.registration.done);
     });
 }
 
-window.textsecure.registerSecondDevice = function(provisionMessage) {
-    var signalingKey = textsecure.crypto.getRandomBytes(32 + 20);
-    textsecure.storage.put('signaling_key', signalingKey);
+window.textsecure.registerSingleDevice = function(number, verificationCode) {
+    return axolotl.util.generateIdentityKeyPair().then(function(identityKeyPair) {
+        return createAccount(number, verificationCode, identityKeyPair, true);
+    });
+};
 
-    var password = btoa(getString(textsecure.crypto.getRandomBytes(16)));
-    password = password.substring(0, password.length - 2);
-    textsecure.storage.put("password", password);
-
-    var registrationId = new Uint16Array(textsecure.crypto.getRandomBytes(2))[0];
-    registrationId = registrationId & 0x3fff;
-    textsecure.storage.put("registrationId", registrationId);
-
-    return textsecure.api.confirmCode(provisionMessage.number, provisionMessage.provisioningCode, password, signalingKey, registrationId, false).then(function(result) {
-        textsecure.storage.user.setNumberAndDeviceId(provisionMessage.number, result.deviceId);
-        textsecure.storage.put("regionCode", libphonenumber.util.getRegionCodeForNumber(provisionMessage.number));
+window.textsecure.registerSecondDevice = function(setProvisioningUrl, confirmNumber, progressCallback) {
+    return textsecure.protocol_wrapper.createIdentityKeyRecvSocket().then(function(cryptoInfo) {
+        return new Promise(function(resolve) {
+            new WebSocketResource(textsecure.api.getTempWebsocket(), function(request) {
+                if (request.path == "/v1/address" && request.verb == "PUT") {
+                    var proto = textsecure.protobuf.ProvisioningUuid.decode(request.body);
+                    setProvisioningUrl([
+                        'tsdevice:/?uuid=', proto.uuid, '&pub_key=',
+                        encodeURIComponent(btoa(getString(cryptoInfo.pubKey)))
+                    ].join(''));
+                    request.respond(200, 'OK');
+                } else if (request.path == "/v1/message" && request.verb == "PUT") {
+                    var envelope = textsecure.protobuf.ProvisionEnvelope.decode(request.body, 'binary');
+                    request.respond(200, 'OK');
+                    resolve(cryptoInfo.decryptAndHandleDeviceInit(envelope).then(function(provisionMessage) {
+                        return confirmNumber(provisionMessage.number).then(function() {
+                            return createAccount(
+                                provisionMessage.number,
+                                provisionMessage.provisioningCode,
+                                provisionMessage.identityKeyPair,
+                                false
+                            );
+                        });
+                    }));
+                } else {
+                    console.log('Unknown websocket message', request.path);
+                }
+            });
+        });
     });
 };
