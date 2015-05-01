@@ -15,9 +15,9 @@
  */
 
 describe('TextSecureWebSocket', function() {
-    var WebSocket = window.WebSocket;
+    var RealWebSocket = window.WebSocket;
     before(function() { window.WebSocket = MockSocket; });
-    after (function() { window.WebSocket = WebSocket;  });
+    after (function() { window.WebSocket = RealWebSocket;  });
     it('connects a websocket', function(done) {
         var mockServer = new MockServer('ws://localhost:8080');
         mockServer.on('connection', function(server) {
@@ -29,6 +29,9 @@ describe('TextSecureWebSocket', function() {
         var socket = new TextSecureWebSocket('ws://localhost:8080');
         socket.onmessage = function(response) {
             assert.strictEqual(response.data, 'hello');
+            mockServer.close();
+        };
+        socket.onclose = function() {
             done();
         };
         socket.send('data');
